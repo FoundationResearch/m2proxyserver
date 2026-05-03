@@ -108,31 +108,47 @@ main() {
 
   # ---------- 3c. /etc/hosts IPv4 pin ----------
   # cloudflared dials Cloudflare's edge by hostname. On networks with broken
-  # IPv6 to Cloudflare (very common at universities / behind some NATs),
-  # cloudflared picks the AAAA record, gets "no route to host", and dies
-  # without falling back to IPv4. Pinning ssh.alexzms.com to the v4 anycast
-  # IPs in /etc/hosts forces v4-only resolution.
+  # IPv6 to Cloudflare (common at universities / behind some NATs), cloudflared
+  # picks the AAAA record, gets "no route to host", and dies without falling
+  # back to IPv4. Pinning ssh.alexzms.com to the v4 anycast IPs in /etc/hosts
+  # forces v4-only resolution.
+  #
+  # We resolve the CURRENT v4 IPs via 1.1.1.1 every time so re-running setup.sh
+  # automatically fixes any drift if Cloudflare ever rotates their anycast pool.
   bold "[3c/8] /etc/hosts IPv4 pin for ssh.alexzms.com"
   local HOSTS_MARK="# m2proxyserver: pin ssh.alexzms.com to IPv4 (fixes cloudflared 'no route to host' on networks with broken IPv6 to Cloudflare)"
-  if grep -qF "$HOSTS_MARK" /etc/hosts 2>/dev/null; then
-    ok "Already pinned (marker present in /etc/hosts)"
-  else
-    log "Adding IPv4 pin to /etc/hosts (will prompt for sudo password)"
-    if sudo tee -a /etc/hosts >/dev/null <<EOF
-
-${HOSTS_MARK}
-104.21.59.64    ssh.alexzms.com
-172.67.216.250  ssh.alexzms.com
-EOF
-    then
-      ok "Pinned ssh.alexzms.com to IPv4 in /etc/hosts"
-    else
-      warn "Could not write /etc/hosts. If ssh fails later with"
-      warn "    'dial tcp [<ipv6>]:443: connect: no route to host'"
-      warn "run this manually:"
-      warn "    echo '104.21.59.64 ssh.alexzms.com' | sudo tee -a /etc/hosts"
-    fi
+  log "Resolving current Cloudflare IPv4 for ssh.alexzms.com (via 1.1.1.1)"
+  local CF_IPS
+  CF_IPS=$(dig @1.1.1.1 +short +time=3 +tries=2 A ssh.alexzms.com 2>/dev/null \
+    | grep -E '^[0-9.]+$' | sort -u)
+  if [ -z "$CF_IPS" ]; then
+    warn "DNS resolution failed; falling back to known-good IPs"
+    CF_IPS=$'104.21.59.64\n172.67.216.250'
   fi
+  ok "Resolved: $(echo $CF_IPS | tr '\n' ' ')"
+
+  log "Refreshing /etc/hosts pin (sudo required; nukes any prior ssh.alexzms.com line and re-adds with current IPs)"
+  local TMP_HOSTS
+  TMP_HOSTS=$(mktemp)
+  awk -v mark="$HOSTS_MARK" '
+    $0 ~ /ssh\.alexzms\.com/ { next }
+    $0 == mark { next }
+    { print }
+  ' /etc/hosts > "$TMP_HOSTS"
+  {
+    printf '\n%s\n' "$HOSTS_MARK"
+    while IFS= read -r ip; do
+      printf '%s\tssh.alexzms.com\n' "$ip"
+    done <<< "$CF_IPS"
+  } >> "$TMP_HOSTS"
+
+  if sudo install -m 644 -o root -g wheel "$TMP_HOSTS" /etc/hosts; then
+    ok "Pinned ssh.alexzms.com → $(echo $CF_IPS | tr '\n' ' ')in /etc/hosts"
+  else
+    warn "Could not write /etc/hosts. If ssh fails with 'no route to host', run manually:"
+    warn "    echo '$(echo $CF_IPS | head -1) ssh.alexzms.com' | sudo tee -a /etc/hosts"
+  fi
+  rm -f "$TMP_HOSTS"
 
   # ---------- 4. SSH key ----------
   bold "[4/8] SSH key"
@@ -257,22 +273,30 @@ EOF
 
   # ---------- 8. Pubkey hand-off ----------
   bold "[8/8] Hand off your public key"
-  echo
-  warn "BEFORE m2-login can work, your public key must be added to the proxy account on the macmini."
-  echo
-  echo "Send this exact line to ${ADMIN_CONTACT}:"
-  echo
-  printf '\033[1;36m'
-  cat "$PUBKEY"
-  printf '\033[0m'
-  echo
-  echo "Easy copy:"
-  echo "    pbcopy < $PUBKEY"
-  echo
-  ok "Setup complete."
 
-  # Pick the most likely rc file the user's interactive shell will read,
-  # so we can tell them exactly what to source.
+  # ANSI palette for the styled sections below.
+  local CR=$'\033[0m'
+  local B=$'\033[1m'
+  local DIM=$'\033[2m'
+  local CYAN=$'\033[1;36m'
+  local YEL=$'\033[1;33m'
+  local RED=$'\033[1;31m'
+  local GRN=$'\033[1;32m'
+  local MAG=$'\033[1;35m'
+  local DIV='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+
+  # Pubkey block — boxed and bright so it's impossible to miss.
+  printf '\n'
+  printf '%s%s%s\n' "$YEL" "  ┌─ Send this exact line to ${ADMIN_CONTACT}" "$CR"
+  printf '%s%s%s\n' "$YEL" "  │" "$CR"
+  while IFS= read -r line; do
+    printf '%s  │  %s%s%s\n' "$YEL" "$CYAN" "$line" "$CR"
+  done < "$PUBKEY"
+  printf '%s%s%s\n' "$YEL" "  │" "$CR"
+  printf '%s%s%s%s%s\n' "$YEL" "  └─ copy with: " "$B" "pbcopy < $PUBKEY" "$CR"
+  printf '\n'
+
+  # Pick the most likely rc file the user's interactive shell will read.
   local SOURCE_HINT=""
   case "$SHELL" in
     *zsh)
@@ -288,29 +312,43 @@ EOF
   esac
   [ -z "$SOURCE_HINT" ] && SOURCE_HINT="source ~/.zshrc   # or ~/.bashrc, whichever your shell uses"
 
-  cat <<EOF
+  printf '%s%s%s\n'  "$GRN" "  ✓ Setup complete." "$CR"
 
-——————————————————————————————————————
-NEXT STEPS
-  1. Send the ssh-ed25519 / ssh-rsa line above to ${ADMIN_CONTACT}.
-  2. Wait for confirmation that your key has been added.
+  # ---------- NEXT STEPS ----------
+  printf '\n%s%s%s\n'   "$DIM"  "$DIV"           "$CR"
+  printf '%s%s%s\n'     "${B}${CYAN}" "  NEXT STEPS"  "$CR"
+  printf '%s%s%s\n\n'   "$DIM"  "$DIV"           "$CR"
 
-  3. Activate the new PATH in THIS shell — pick one:
-        ${SOURCE_HINT}
-     or just open a new terminal window.
+  printf '  %s1.%s Send the public key above to %s%s%s on Slack.\n' \
+    "$B" "$CR" "$MAG" "$ADMIN_CONTACT" "$CR"
+  printf '  %s2.%s Wait for confirmation that your key has been added.\n' \
+    "$B" "$CR"
+  printf '  %s3.%s Activate the new PATH in %sTHIS%s shell:\n' \
+    "$B" "$CR" "$B" "$CR"
+  printf '         %s%s%s\n' "$CYAN" "$SOURCE_HINT" "$CR"
+  printf '       %sor%s open a new terminal window.\n' "$DIM" "$CR"
+  printf '  %s4.%s Run:\n' "$B" "$CR"
+  printf '         %s%s%s   %s# obtain Teleport cert (~24h)%s\n' \
+    "$CYAN" "m2-login" "$CR" "$DIM" "$CR"
+  printf '         %s%s%s   %s# connect to cluster login node%s\n' \
+    "$CYAN" "ssh m2-login-003" "$CR" "$DIM" "$CR"
 
-  4. Run:
-        m2-login
-        ssh m2-login-003
+  # ---------- VS Code ----------
+  printf '\n%s%s%s\n'   "$DIM"  "$DIV"           "$CR"
+  printf '%s%s%s\n'     "${B}${CYAN}" "  VS CODE / CURSOR / ANTIGRAVITY"  "$CR"
+  printf '%s%s%s\n\n'   "$DIM"  "$DIV"           "$CR"
+  printf '  Remote-SSH  →  Connect to Host  →  %s%s%s\n' "$CYAN" "m2-login-003" "$CR"
 
-VS Code / Cursor / Antigravity:
-  Remote-SSH → Connect to Host → m2-login-003
-
-NEVER ssh / tsh directly to mbzuai-hpc.teleport.sh from your laptop or
-any non-macmini machine. The cluster bans the shared account if it sees
-multiple source IPs. All traffic must flow through macmini.
-——————————————————————————————————————
-EOF
+  # ---------- Hard rule ----------
+  printf '\n%s%s%s\n'   "$DIM"  "$DIV"           "$CR"
+  printf '%s%s%s\n'     "${B}${RED}" "  ⚠  HARD RULE — DO NOT VIOLATE"  "$CR"
+  printf '%s%s%s\n\n'   "$DIM"  "$DIV"           "$CR"
+  printf '  %sNEVER%s ssh / tsh directly to %smbzuai-hpc.teleport.sh%s from your\n' \
+    "${B}${RED}" "$CR" "$B" "$CR"
+  printf '  laptop or %sany non-macmini machine%s. The cluster bans the shared\n' \
+    "$B" "$CR"
+  printf '  account if it sees multiple source IPs. %sAll traffic must flow\n' "$B"
+  printf '  through macmini.%s\n\n' "$CR"
 }
 
 main "$@"

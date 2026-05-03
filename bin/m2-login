@@ -117,8 +117,8 @@ check_etc_hosts_drift() {
       warn "  pinned: $(echo $pinned_ips | tr '\n' ' ')"
       warn "  DNS:    $(echo $dns_ips | tr '\n' ' ')"
       warn "Usually still works (CF anycast + SNI routing). If you start seeing"
-      warn "'dial tcp ...: no route to host', refresh by re-running:"
-      warn "    sudo sed -i '' '/m2proxyserver/,+2d' /etc/hosts"
+      warn "'dial tcp ...: no route to host', refresh by re-running setup.sh —"
+      warn "it will dig the current IPs and rewrite /etc/hosts automatically:"
       warn "    curl -fsSL https://raw.githubusercontent.com/FoundationResearch/m2proxyserver/main/setup.sh | bash"
       break
     fi
