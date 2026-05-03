@@ -28,6 +28,22 @@ ask()   { local prompt="$1"; printf '\033[1;35m?\033[0m %s ' "$prompt"; read -r 
 # consume script bytes from the curl pipe. Pre-parsing into a function means
 # bash no longer needs to read more from stdin once main() starts executing.
 main() {
+  # ANSI palette used by the styled sections below.
+  local CR=$'\033[0m'
+  local B=$'\033[1m'
+  local DIM=$'\033[2m'
+  local CYAN=$'\033[1;36m'
+  local YEL=$'\033[1;33m'
+  local RED=$'\033[1;31m'
+  local GRN=$'\033[1;32m'
+  local MAG=$'\033[1;35m'
+  local DIV='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+
+  # DONE accumulates a one-line summary for each change actually made, so
+  # we can show the user a clean "what changed" report at the end (skipping
+  # everything that was already in place).
+  local DONE=()
+
   # Resolve where bin/m2-login lives. If we're running from a clone, use the
   # local copy; if we're piped via curl | bash, fetch from GitHub.
   local REPO_DIR=""
@@ -43,6 +59,30 @@ main() {
     exit 1
   fi
   ok "macOS detected ($(sw_vers -productName) $(sw_vers -productVersion))"
+
+  # ---------- Plan + consent ----------
+  printf '\n%s%s%s\n'   "$DIM" "$DIV" "$CR"
+  printf '%s%s%s\n'     "${B}${CYAN}" "  This installer will (skipping anything already in place):" "$CR"
+  printf '%s%s%s\n\n'   "$DIM" "$DIV" "$CR"
+  printf '  • install %sHomebrew%s, %scloudflared%s, and a %sChromium-family browser%s (only if missing)\n' \
+    "$B" "$CR" "$B" "$CR" "$B" "$CR"
+  printf '  • generate an %sed25519 SSH key%s (only if you don'"'"'t already have one)\n' "$B" "$CR"
+  printf '  • write a marker block to %s~/.ssh/config%s defining:\n' "$B" "$CR"
+  printf '        Host %smacmini%s,  %sm2-login-001%s,  %sm2-login-003%s,  %s*.mbzuai-hpc.teleport.sh%s\n' \
+    "$CYAN" "$CR" "$CYAN" "$CR" "$CYAN" "$CR" "$CYAN" "$CR"
+  printf '  • pin %sssh.alexzms.com%s to current Cloudflare IPv4 in %s/etc/hosts%s\n' "$B" "$CR" "$B" "$CR"
+  printf '        %s(will prompt for sudo password)%s\n' "$DIM" "$CR"
+  printf '  • install %s~/.local/bin/m2-login%s\n' "$B" "$CR"
+  printf '  • add %s~/.local/bin%s to PATH in %s~/.zshrc%s / %s~/.bashrc%s (marker block)\n' \
+    "$B" "$CR" "$B" "$CR" "$B" "$CR"
+  printf '\n  %sRe-running is safe and idempotent.%s\n\n' "$DIM" "$CR"
+
+  ask "Proceed? [Y/n]"
+  if [[ "${REPLY:-Y}" =~ ^[Nn]$ ]]; then
+    err "Aborted by user."
+    exit 0
+  fi
+  echo
 
   # ---------- 2. Homebrew ----------
   bold "[2/8] Homebrew"
@@ -62,6 +102,7 @@ main() {
     if [ -x /opt/homebrew/bin/brew ]; then
       eval "$(/opt/homebrew/bin/brew shellenv)"
     fi
+    DONE+=("Installed Homebrew")
   fi
   ok "Homebrew: $(brew --version | head -1)"
 
@@ -70,6 +111,7 @@ main() {
   if ! command -v cloudflared >/dev/null 2>&1; then
     log "Installing cloudflared via Homebrew..."
     brew install cloudflared < /dev/null
+    DONE+=("Installed cloudflared via Homebrew")
   fi
   ok "cloudflared: $(cloudflared --version 2>&1 | head -1)"
 
@@ -103,6 +145,7 @@ main() {
     fi
     brew install --cask google-chrome < /dev/null
     HAVE_CHROMIUM="/Applications/Google Chrome.app"
+    DONE+=("Installed Google Chrome via Homebrew")
   fi
   ok "Found: $HAVE_CHROMIUM"
 
@@ -144,6 +187,7 @@ main() {
 
   if sudo install -m 644 -o root -g wheel "$TMP_HOSTS" /etc/hosts; then
     ok "Pinned ssh.alexzms.com → $(echo $CF_IPS | tr '\n' ' ')in /etc/hosts"
+    DONE+=("Pinned ssh.alexzms.com → $(echo $CF_IPS | tr '\n' ', ' | sed 's/, $//') in /etc/hosts")
   else
     warn "Could not write /etc/hosts. If ssh fails with 'no route to host', run manually:"
     warn "    echo '$(echo $CF_IPS | head -1) ssh.alexzms.com' | sudo tee -a /etc/hosts"
@@ -168,6 +212,7 @@ main() {
     log "No existing SSH public key found — generating a new ed25519 key"
     ssh-keygen -t ed25519 -f "$SSH_DIR/id_ed25519" -N "" < /dev/null
     PUBKEY="$SSH_DIR/id_ed25519.pub"
+    DONE+=("Generated new ed25519 SSH key at ~/.ssh/id_ed25519")
   fi
   ok "Using public key: $PUBKEY"
 
@@ -217,6 +262,7 @@ EOF
   mv "$TMP_CFG" "$SSH_CONFIG"
   chmod 600 "$SSH_CONFIG"
   ok "SSH config updated"
+  DONE+=("Wrote m2proxyserver block to ~/.ssh/config (Host macmini, m2-login-001, m2-login-003, *.mbzuai-hpc.teleport.sh)")
 
   # ---------- 6. m2-login script ----------
   bold "[6/8] m2-login script"
@@ -237,6 +283,7 @@ EOF
   install -m 755 "$M2_LOGIN_SRC" "$INSTALL_DIR/m2-login"
   [ -n "$M2_LOGIN_TMP" ] && rm -f "$M2_LOGIN_TMP"
   ok "Installed: $INSTALL_DIR/m2-login"
+  DONE+=("Installed ~/.local/bin/m2-login")
 
   # ---------- 7. PATH / shell rc ----------
   bold "[7/8] Shell PATH"
@@ -269,21 +316,25 @@ case ":\$PATH:" in *":\$HOME/.local/bin:"*) ;; *) export PATH="\$HOME/.local/bin
 ${MARK_END}
 EOF
     ok "PATH block added to $rc"
+    DONE+=("Added ~/.local/bin to PATH in ${rc/#$HOME/~}")
   done
 
   # ---------- 8. Pubkey hand-off ----------
   bold "[8/8] Hand off your public key"
 
-  # ANSI palette for the styled sections below.
-  local CR=$'\033[0m'
-  local B=$'\033[1m'
-  local DIM=$'\033[2m'
-  local CYAN=$'\033[1;36m'
-  local YEL=$'\033[1;33m'
-  local RED=$'\033[1;31m'
-  local GRN=$'\033[1;32m'
-  local MAG=$'\033[1;35m'
-  local DIV='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+  # ---------- Changes made (summary) ----------
+  printf '\n%s%s%s\n'   "$DIM" "$DIV" "$CR"
+  printf '%s%s%s\n'     "${B}${CYAN}" "  Changes made" "$CR"
+  printf '%s%s%s\n\n'   "$DIM" "$DIV" "$CR"
+  if [ ${#DONE[@]} -eq 0 ]; then
+    printf '  %sNo changes — everything was already in place.%s\n\n' "$DIM" "$CR"
+  else
+    local entry
+    for entry in "${DONE[@]}"; do
+      printf '  %s✓%s %s\n' "$GRN" "$CR" "$entry"
+    done
+    printf '\n  %s(Anything not listed was already up to date.)%s\n\n' "$DIM" "$CR"
+  fi
 
   # Pubkey block — boxed and bright so it's impossible to miss.
   printf '\n'
