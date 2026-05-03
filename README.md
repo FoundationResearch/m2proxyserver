@@ -34,15 +34,15 @@ VS Code, Cursor, Antigravity: Remote-SSH → **Connect to Host…** → `m2-logi
 
 ```
 m2-login            log in and sync cert (default)
-m2-login status     show current cert status on the macmini
+m2-login status     show current cert status on the m2proxymachine
 ```
 
 ## Rules
 
 Violating any of these risks the shared cluster account being suspended. They are not optional.
 
-1. **Do not bypass `m2-login` to authenticate to Okta.** The script routes the Okta browser session through an SSH SOCKS5 tunnel into the macmini, in an isolated Chromium profile. Logging in through your normal browser exposes your laptop's IP to the Okta audit log.
-2. **Do not connect to `mbzuai-hpc.teleport.sh` from any machine other than via the configured `m2-login-*` aliases.** All cluster traffic must originate from the macmini's IP. A second source IP triggers an account ban.
+1. **Do not bypass `m2-login` to authenticate to Okta.** The script routes the Okta browser session through an SSH SOCKS5 tunnel into the m2proxymachine, in an isolated Chromium profile. Logging in through your normal browser exposes your laptop's IP to the Okta audit log.
+2. **Do not connect to `mbzuai-hpc.teleport.sh` from any machine other than via the configured `m2-login-*` aliases.** All cluster traffic must originate from the m2proxymachine's IP. A second source IP triggers an account ban.
 3. **Do not share or copy your `~/.tsh/` directory.** The cert it contains is short-lived but still a credential.
 
 ## Requirements
