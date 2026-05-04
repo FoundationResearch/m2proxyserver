@@ -342,7 +342,61 @@ log "Starting tsh login on ${JUMP_HOST}. If Okta is needed, an isolated Chrome w
 
 opened=""
 cert_fresh=""
+# Regex matches the OAuth callback URL tsh prints. We use it twice:
+#   1. as a *filter* — never echo a line containing it, because every
+#      modern terminal (iTerm/Terminal/kitty/wezterm/Windows Terminal)
+#      auto-linkifies URLs and Cmd/Ctrl-clicking opens the system *default*
+#      browser. That bypasses our SOCKS5 + isolated profile and leaks the
+#      laptop's IP to Okta.
+#   2. as the actual URL we hand to the locked-down Chrome instance.
+URL_RE='http://127\.0\.0\.1:[0-9]+/[a-zA-Z0-9-]+'
 while IFS= read -r line; do
+  if [[ "$line" =~ $URL_RE ]]; then
+    URL="${BASH_REMATCH[0]}"
+    if [ -z "$cert_fresh" ] && [ -z "$opened" ]; then
+      printf '\033[1;36m→ OAuth URL received — opening in isolated Chrome via SOCKS5.\033[0m\n'
+      printf '\033[2m  (URL deliberately withheld so it can'"'"'t be Cmd/Ctrl-clicked into your default browser, which would leak your IP to Okta.)\033[0m\n'
+      # Lock the browser down so Okta's network-level audit log only ever sees
+      # the m2proxymachine IP — no laptop fingerprint:
+      #   --proxy-server  all HTTP/HTTPS via SOCKS5; DNS too since socks5:// (not socks://)
+      #                   makes Chrome resolve hostnames remotely through the proxy.
+      #                   IPv6 destinations also go through SOCKS5, which supports them,
+      #                   so dual-stack hosts don't bypass.
+      #   --force-webrtc-ip-handling-policy=disable_non_proxied_udp
+      #                   kills WebRTC's UDP entirely when no UDP proxy exists.
+      #                   This blocks both STUN (which would otherwise leak the
+      #                   laptop's WAN IP) and mDNS host candidates (which would
+      #                   leak the laptop's LAN hostname/IP).
+      #   --disable-background-networking / --disable-sync / --disable-component-update
+      #   --disable-default-apps / --no-pings
+      #                   silence Chrome's chatty side traffic so nothing
+      #                   non-Okta accidentally fires a non-proxied request.
+      # If we picked a Windows-side browser (WSL fallback), --user-data-dir
+      # must be a Windows path or Chrome silently falls back to the default
+      # profile — defeating the isolation.
+      profile_arg="$CHROME_PROFILE"
+      if [[ "$CHROME" == /mnt/c/* ]] && command -v wslpath >/dev/null 2>&1; then
+        mkdir -p "$CHROME_PROFILE"
+        profile_arg=$(wslpath -w "$CHROME_PROFILE")
+      fi
+      "$CHROME" \
+        --user-data-dir="$profile_arg" \
+        --proxy-server="socks5://localhost:${SOCKS_PORT}" \
+        --proxy-bypass-list="127.0.0.1,localhost" \
+        --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
+        --disable-background-networking \
+        --disable-component-update \
+        --disable-sync \
+        --disable-default-apps \
+        --no-pings \
+        --no-first-run \
+        --no-default-browser-check \
+        --new-window \
+        "$URL" >/dev/null 2>&1 &
+      opened=1
+    fi
+    continue
+  fi
   printf '%s\n' "$line"
   case "$line" in
     M2LOGIN_WAITING_LOCK)
@@ -353,48 +407,6 @@ while IFS= read -r line; do
       cert_fresh=1
       ;;
   esac
-  if [ -z "$cert_fresh" ] && [ -z "$opened" ] && [[ "$line" =~ http://127\.0\.0\.1:[0-9]+/[a-zA-Z0-9-]+ ]]; then
-    URL="${BASH_REMATCH[0]}"
-    printf '\033[1;36m→ Opening URL via SOCKS5/m2proxymachine in isolated Chrome:\n  %s\033[0m\n' "$URL"
-    # Lock the browser down so Okta's network-level audit log only ever sees
-    # the m2proxymachine IP — no laptop fingerprint:
-    #   --proxy-server  all HTTP/HTTPS via SOCKS5; DNS too since socks5:// (not socks://)
-    #                   makes Chrome resolve hostnames remotely through the proxy.
-    #                   IPv6 destinations also go through SOCKS5, which supports them,
-    #                   so dual-stack hosts don't bypass.
-    #   --force-webrtc-ip-handling-policy=disable_non_proxied_udp
-    #                   kills WebRTC's UDP entirely when no UDP proxy exists.
-    #                   This blocks both STUN (which would otherwise leak the
-    #                   laptop's WAN IP) and mDNS host candidates (which would
-    #                   leak the laptop's LAN hostname/IP).
-    #   --disable-background-networking / --disable-sync / --disable-component-update
-    #   --disable-default-apps / --no-pings
-    #                   silence Chrome's chatty side traffic so nothing
-    #                   non-Okta accidentally fires a non-proxied request.
-    # If we picked a Windows-side browser (WSL fallback), --user-data-dir
-    # must be a Windows path or Chrome silently falls back to the default
-    # profile — defeating the isolation.
-    profile_arg="$CHROME_PROFILE"
-    if [[ "$CHROME" == /mnt/c/* ]] && command -v wslpath >/dev/null 2>&1; then
-      mkdir -p "$CHROME_PROFILE"
-      profile_arg=$(wslpath -w "$CHROME_PROFILE")
-    fi
-    "$CHROME" \
-      --user-data-dir="$profile_arg" \
-      --proxy-server="socks5://localhost:${SOCKS_PORT}" \
-      --proxy-bypass-list="127.0.0.1,localhost" \
-      --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
-      --disable-background-networking \
-      --disable-component-update \
-      --disable-sync \
-      --disable-default-apps \
-      --no-pings \
-      --no-first-run \
-      --no-default-browser-check \
-      --new-window \
-      "$URL" >/dev/null 2>&1 &
-    opened=1
-  fi
 done < <(
   ssh -o ServerAliveInterval=30 "$JUMP_HOST" "
     LOCKDIR=/tmp/m2-login.lock.d
