@@ -61,10 +61,74 @@ ssh_retry() {
   return 1
 }
 
+# Inspect the local Teleport cert with ssh-keygen and return seconds until
+# expiry. Echoes -1 if the cert is missing or unparseable.
+local_cert_remaining() {
+  local cert valid_to exp
+  cert="$LOCAL_TSH_DIR/keys/mbzuai-hpc.teleport.sh/${TELEPORT_USER}-ssh/mbzuai-hpc.teleport.sh-cert.pub"
+  [ -f "$cert" ] || { echo -1; return; }
+  # ssh-keygen -L prints "        Valid: from <iso> to <iso>"
+  valid_to=$(ssh-keygen -L -f "$cert" 2>/dev/null | awk '/Valid:/ {print $5}')
+  [ -z "$valid_to" ] && { echo -1; return; }
+  # macOS BSD date vs Linux GNU date — try both.
+  exp=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$valid_to" +%s 2>/dev/null) \
+    || exp=$(date -d "$valid_to" +%s 2>/dev/null) \
+    || { echo -1; return; }
+  echo $((exp - $(date +%s)))
+}
+
 case "${1:-login}" in
   status)
     ssh_retry "$JUMP_HOST" "$TSH status"
     exit $?
+    ;;
+  check)
+    # Hook for ssh ProxyCommand: ensure the Teleport cert is usable, in a
+    # non-interactive way that NEVER opens Okta. Three outcomes:
+    #   exit 0 — local cert valid (silent), or just refreshed via fast path
+    #   exit 1 — refresh would require Okta, user must run `m2-login` themself
+    # Designed to add ~10ms to every `ssh m2-login-*` when cert is fresh.
+    #
+    # NOTE on WSL: the sync_cert here only updates the WSL-side ~/.tsh/.
+    # If the user is also using Windows-native ssh (VS Code etc.), they
+    # should run `m2-login` from WSL to get the Windows-side .tsh\
+    # mirror updated too — this fast-path skips that.
+    remaining=$(local_cert_remaining)
+    if [ "$remaining" -gt 300 ]; then
+      exit 0
+    fi
+    # Local cert expired (or expiring within 5 min). See if the shared cert
+    # on the jump host is fresh — if so, just rsync it down silently.
+    quick_status=$(ssh -o ConnectTimeout=10 "$JUMP_HOST" \
+      "$TSH status 2>/dev/null | grep '\\[valid for'" 2>/dev/null || true)
+    if echo "$quick_status" | grep -qE '\[valid for [1-9][0-9]*h'; then
+      printf '\033[1;34m→\033[0m Local cert stale; pulling fresh shared cert from %s...\n' "$JUMP_HOST" >&2
+      # Inline rsync (the elaborate sync_cert with Windows mirror is defined
+      # later and depends on functions defined later still — too much to
+      # hoist for a hook that runs before --check parses anything else).
+      mkdir -p "$LOCAL_TSH_DIR"
+      if ! rsync -a -e "ssh -o ConnectTimeout=15" "${JUMP_HOST}:.tsh/keys/" "${LOCAL_TSH_DIR}/keys/" >&2; then
+        err "cert sync failed"
+        exit 1
+      fi
+      rsync -a -e "ssh -o ConnectTimeout=15" \
+        "${JUMP_HOST}:.tsh/current-profile" \
+        "${JUMP_HOST}:.tsh/mbzuai-hpc.teleport.sh.yaml" \
+        "${JUMP_HOST}:.tsh/known_hosts" \
+        "${LOCAL_TSH_DIR}/" 2>/dev/null || true
+      chmod 700 "${LOCAL_TSH_DIR}/keys" 2>/dev/null || true
+      find "${LOCAL_TSH_DIR}/keys" -type d -exec chmod 700 {} + 2>/dev/null || true
+      find "${LOCAL_TSH_DIR}/keys" -type f -exec chmod 600 {} + 2>/dev/null || true
+      exit 0
+    fi
+    # Both stale. Don't auto-Okta from inside an ssh ProxyCommand —
+    # it would mean a Chrome window unexpectedly popping up while the
+    # user thought they were just typing `ssh m2-login-001`, and the
+    # OAuth callback could time out before they complete it.
+    err "Teleport cert is expired and a fresh one needs Okta SSO."
+    err "Run interactively first:   m2-login"
+    err "then retry your ssh / VS Code Remote-SSH / scp / rsync."
+    exit 1
     ;;
   login|"")
     ;;
@@ -74,7 +138,7 @@ case "${1:-login}" in
     exit 2
     ;;
   *)
-    err "unknown command: $1 (use: login | status)"
+    err "unknown command: $1 (use: login | status | check)"
     exit 2
     ;;
 esac
