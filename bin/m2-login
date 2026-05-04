@@ -41,8 +41,14 @@ if grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease 2>/dev/null; then
   IS_WSL=1
 fi
 
-# Self-update: this URL is per-branch — main checks main, wsl checks wsl.
+# Self-update: these URLs are per-branch — main checks main, wsl checks wsl.
+# Detection compares the local file to bin/m2-login on the branch.
+# Apply re-runs setup.sh (idempotent), so it picks up not just m2-login but
+# also ssh config block / /etc/hosts pin / base deps. NOTE: this only
+# refreshes the WSL-side install — Windows-side ssh config / cloudflared.exe
+# require re-cloning + ./setup-wsl.sh manually.
 M2_RAW_URL="https://raw.githubusercontent.com/FoundationResearch/m2proxyserver/wsl/bin/m2-login"
+M2_SETUP_URL="https://raw.githubusercontent.com/FoundationResearch/m2proxyserver/wsl/setup.sh"
 UPDATE_CHECK_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/m2-login-update-check"
 UPDATE_CHECK_TTL=86400   # 24h between auto-checks
 
@@ -67,12 +73,18 @@ ssh_retry() {
 }
 
 # Quietly check if a newer m2-login is available on the configured branch.
-# Prompts to apply (Y/n). Re-execs the new version on apply.
+# Detection: diff local file vs branch's bin/m2-login. If different, prompt
+# to apply, and on Y re-run setup.sh (which is idempotent and updates
+# m2-login + ssh config + /etc/hosts pin + PATH in one shot).
 #
 # Called from the interactive `login` flow only — never from `check`
 # (which runs on every ssh; can't tolerate a 5s curl) or `status`.
-# Skips silently if curl is missing, network down, no /dev/tty, or the
-# user set M2_LOGIN_NO_UPDATE_CHECK=1. 24h cache so we don't nag.
+# Skips silently if curl is missing, network down, or
+# M2_LOGIN_NO_UPDATE_CHECK=1 is set in the env. 24h cache so we don't nag.
+#
+# WSL note: setup.sh only refreshes the WSL/Linux side. Windows-side
+# (cloudflared.exe, .ssh\config block) needs a manual re-clone +
+# ./setup-wsl.sh — those don't change often.
 check_for_updates() {
   local force=""
   [ "${1:-}" = "force" ] && { force=1; shift; }
@@ -97,10 +109,15 @@ check_for_updates() {
   date +%s > "$UPDATE_CHECK_CACHE"
 
   if cmp -s "$tmp" "$self"; then
-    rm -f "$tmp"; return 0
+    rm -f "$tmp"
+    [ -n "$force" ] && ok "Already up to date."
+    return 0
   fi
+  rm -f "$tmp"  # don't need it; setup.sh will fetch and install
 
   warn "An update for m2-login is available."
+  log "Applying it re-runs setup.sh, which also refreshes ssh config / /etc/hosts pin if needed."
+  log "(may prompt for sudo for /etc/hosts; WSL-side only — Windows side stays as-is)"
   printf '\033[1;35m?\033[0m Apply update now? [Y/n] '
   local reply=""
   # /dev/tty may be readable as a device node yet error on actual open
@@ -113,16 +130,15 @@ check_for_updates() {
   fi
   if [[ "${reply:-Y}" =~ ^[Nn]$ ]]; then
     log "Update skipped (will ask again in 24h; force with: m2-login update)."
-    rm -f "$tmp"
     return 0
   fi
 
-  if ! install -m 755 "$tmp" "$self" 2>/dev/null; then
-    err "Could not write to $self — update aborted."
-    rm -f "$tmp"; return 0
+  log "Running: curl -fsSL $M2_SETUP_URL | bash"
+  if ! curl -fsSL "$M2_SETUP_URL" | bash; then
+    err "Update failed (setup.sh exited non-zero). Local m2-login left unchanged."
+    return 1
   fi
-  rm -f "$tmp"
-  ok "Updated. Re-launching with new version..."
+  ok "Update complete. Re-launching with new version..."
   exec "$self" "$@"
 }
 
@@ -150,7 +166,6 @@ case "${1:-login}" in
   update)
     shift || true
     check_for_updates force "$@"
-    ok "Already up to date."
     exit 0
     ;;
   check)
