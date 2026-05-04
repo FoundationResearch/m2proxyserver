@@ -78,7 +78,24 @@ Violating any of these risks the shared cluster account being suspended. They ar
 - WSL2 with Ubuntu / Debian (apt). Tested on Ubuntu 24.04.
 - Windows 10/11 with the built-in OpenSSH client (default since Win10 1809).
 - WSL/Windows interop enabled (`cmd.exe` + `wslpath` reachable from WSL — the default on modern WSL2).
-- A Chromium-family browser somewhere. **Only needed for the rare first-of-day Okta login** — `m2-login` skips Okta entirely when the shared cert on the jump host is still fresh (≥1 h left), which is the common case. For the cold-start case `m2-login` searches PATH for `chromium`/`google-chrome`/`brave-browser`/`microsoft-edge`, then falls back to Windows-side `chrome.exe`/`msedge.exe`/`brave.exe` under `/mnt/c/...`.
+- A Chromium-family browser somewhere. **Only needed for the rare first-of-day Okta login** — `m2-login` skips Okta entirely when the shared cert on the jump host is still fresh (≥1 h left), which is the common case. For the cold-start case `m2-login` searches PATH for `chromium`/`google-chrome`/`brave-browser`/`microsoft-edge`, then falls back to Windows-side `chrome.exe`/`msedge.exe`/`brave.exe` under `/mnt/c/...` (also queries Windows for `%ProgramFiles%`, `%ProgramFiles(x86)%`, `%LOCALAPPDATA%` to handle non-C: drive Windows installs and per-user Chrome).
+
+## Troubleshooting
+
+### `STRICT mode requires a Chromium-family browser`
+
+Hit only when `m2-login` actually needs to open Okta (rare; most days the fast path skips it). It means none of the auto-detected paths matched. Pick whichever is easiest:
+
+- **Point at your existing browser** — works regardless of where it lives:
+  ```bash
+  M2_LOGIN_BROWSER='/mnt/c/Path/To/msedge.exe' m2-login
+  ```
+  Persist by exporting it from `~/.bashrc` / `~/.zshrc`.
+- **Install Microsoft Edge on Windows** if you somehow don't have it (it ships with Windows 10/11, but enterprise images sometimes strip it). Re-run `m2-login`.
+- **Install Chromium inside WSL** as a last resort: `sudo apt-get install -y chromium-browser`. Note that on Ubuntu 24.04 this is a snap and needs a working DISPLAY (WSLg).
+- **Wait for a teammate to refresh the cert.** Once the shared cert is fresh, `m2-login` skips the browser entirely — you can run again and walk straight in.
+
+`brew` is **not** needed on WSL — that hint in the error message only applies to macOS.
 
 ## Notes on the Windows hosts file
 

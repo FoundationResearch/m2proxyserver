@@ -234,7 +234,24 @@ check_for_updates "$@"
 
 # Locate a Chromium-family browser. Strict mode requires one because Safari
 # and Firefox don't support per-instance proxy via CLI flags.
+#
+# Order of resolution:
+#   1. M2_LOGIN_BROWSER env var (manual escape hatch — set this if your
+#      browser is in an unusual location and the heuristics below miss it).
+#   2. Standard install locations (fast path; no Windows interop calls).
+#   3. On WSL only: query Windows for %ProgramFiles%, %ProgramFiles(x86)%,
+#      and %LOCALAPPDATA%, then probe vendor subpaths under each. Catches
+#      Windows installed on a non-C: drive and per-user Chrome installs
+#      under %LOCALAPPDATA%\Google\Chrome\Application\chrome.exe.
 find_browser() {
+  if [ -n "${M2_LOGIN_BROWSER:-}" ]; then
+    if [ -x "$M2_LOGIN_BROWSER" ]; then
+      printf '%s' "$M2_LOGIN_BROWSER"
+      return 0
+    fi
+    err "M2_LOGIN_BROWSER is set but not executable: $M2_LOGIN_BROWSER"
+  fi
+
   local app cmd
   case "$(uname -s)" in
     Darwin)
@@ -260,6 +277,7 @@ find_browser() {
       # WSL fallback: a Windows-side Chromium browser. WSL2 forwards localhost
       # so socks5://localhost:51080 works from Windows-side too.
       if [ -n "$IS_WSL" ]; then
+        # Fast path: hardcoded standard install locations.
         for app in \
           "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe" \
           "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe" \
@@ -271,6 +289,29 @@ find_browser() {
             return 0
           fi
         done
+        # Dynamic path: ask Windows where its program dirs actually are.
+        # Handles non-C: Windows installs and per-user Chrome under
+        # %LOCALAPPDATA%\Google\Chrome\Application\chrome.exe.
+        if command -v cmd.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
+          local var pf sub
+          for var in 'ProgramFiles' 'ProgramFiles(x86)' 'LOCALAPPDATA'; do
+            pf=$(cd /mnt/c 2>/dev/null && cmd.exe /c "echo %${var}%" 2>/dev/null | tr -d '\r\n')
+            [ -z "$pf" ] && continue
+            # cmd echoes the literal '%foo%' if the var is unset.
+            case "$pf" in %*%) continue ;; esac
+            pf=$(wslpath -u "$pf" 2>/dev/null) || continue
+            for sub in \
+              'Microsoft/Edge/Application/msedge.exe' \
+              'Google/Chrome/Application/chrome.exe' \
+              'Chromium/Application/chrome.exe' \
+              'BraveSoftware/Brave-Browser/Application/brave.exe'; do
+              if [ -x "$pf/$sub" ]; then
+                printf '%s' "$pf/$sub"
+                return 0
+              fi
+            done
+          done
+        fi
       fi
       ;;
   esac
@@ -284,10 +325,15 @@ if ! CHROME=$(find_browser); then
     Darwin) err "Install Chrome:  brew install --cask google-chrome" ;;
     Linux)
       if [ -n "$IS_WSL" ]; then
-        err "On WSL: install Microsoft Edge or Chrome on Windows, or apt install chromium."
+        err "On WSL, easiest is to use a Windows-side Chromium browser:"
+        err "  • Microsoft Edge ships with Windows 10/11 — usually auto-detected."
+        err "  • If yours lives somewhere unusual, point us at it explicitly:"
+        err "      M2_LOGIN_BROWSER='/mnt/c/Path/To/msedge.exe' m2-login"
+        err "  • Or install Chromium inside WSL: sudo apt-get install -y chromium-browser"
       else
         err "Install Chromium:  sudo apt-get install -y chromium  (or chromium-browser)"
         err "Or download Chrome: https://www.google.com/chrome/"
+        err "Or set M2_LOGIN_BROWSER=/path/to/your/browser to override detection."
       fi
       ;;
   esac
