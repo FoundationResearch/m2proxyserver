@@ -309,6 +309,12 @@ EOF
         !skip
       ' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
     fi
+    # If the rc file doesn't end with a newline, our marker comment would
+    # glue onto whatever the last line was (POSIX text files should end
+    # with \n, but hand-edited zshrc/bashrc often don't).
+    if [ -s "$rc" ] && [ "$(tail -c1 "$rc" | wc -l | tr -d ' ')" -eq 0 ]; then
+      printf '\n' >> "$rc"
+    fi
     cat >> "$rc" <<EOF
 ${MARK_BEGIN}
 # Add m2-login to PATH
