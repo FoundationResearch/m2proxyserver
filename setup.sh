@@ -19,8 +19,19 @@ ok()    { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m!\033[0m %s\n' "$*"; }
 err()   { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; }
 # Read prompts from the controlling tty so `curl ... | bash` still works
-# (otherwise stdin is the script itself).
-ask()   { local prompt="$1"; printf '\033[1;35m?\033[0m %s ' "$prompt"; read -r REPLY < /dev/tty; }
+# (otherwise stdin is the script itself). When no tty is available
+# (e.g. an automated installer environment), accept the default by leaving
+# REPLY empty — call sites already handle that via "${REPLY:-Y}".
+ask()   {
+  local prompt="$1"
+  printf '\033[1;35m?\033[0m %s ' "$prompt"
+  REPLY=""
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    read -r REPLY < /dev/tty || REPLY=""
+  else
+    printf '(no tty — using default)\n'
+  fi
+}
 
 # Everything below lives in main() so bash parses the whole script body BEFORE
 # any child process runs. This is the standard `curl | bash` defense: brew's
@@ -54,11 +65,34 @@ main() {
 
   # ---------- 1. Pre-flight ----------
   bold "[1/8] Pre-flight checks"
-  if [ "$(uname -s)" != "Darwin" ]; then
-    err "This installer currently supports macOS only."
-    exit 1
-  fi
-  ok "macOS detected ($(sw_vers -productName) $(sw_vers -productVersion))"
+  local IS_MAC="" IS_LINUX="" IS_WSL="" OS_LABEL=""
+  case "$(uname -s)" in
+    Darwin)
+      IS_MAC=1
+      OS_LABEL="$(sw_vers -productName) $(sw_vers -productVersion)"
+      ;;
+    Linux)
+      IS_LINUX=1
+      if grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease 2>/dev/null; then
+        IS_WSL=1
+      fi
+      if [ -r /etc/os-release ]; then
+        OS_LABEL="$(. /etc/os-release && printf '%s %s' "${PRETTY_NAME:-$NAME}" "${VERSION_ID:-}")"
+      else
+        OS_LABEL="Linux"
+      fi
+      [ -n "$IS_WSL" ] && OS_LABEL="$OS_LABEL (WSL)"
+      ;;
+    *)
+      err "Unsupported OS: $(uname -s) (need macOS or Linux)"
+      exit 1
+      ;;
+  esac
+  ok "${OS_LABEL} detected"
+
+  # Privileged commands: only prepend sudo if we're not already root.
+  local SUDO=""
+  if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi
 
   # ---------- Plan + consent ----------
   printf '\n%s%s%s\n'   "$DIM" "$DIV" "$CR"
@@ -84,34 +118,78 @@ main() {
   fi
   echo
 
-  # ---------- 2. Homebrew ----------
-  bold "[2/8] Homebrew"
-  if ! command -v brew >/dev/null 2>&1; then
-    warn "Homebrew not found. Install it (will run the official installer):"
-    ask "Install Homebrew now? [y/N]"
-    if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-      # The Homebrew installer reads "Press RETURN to continue" from stdin
-      # AND prompts sudo for /opt/homebrew ownership. Both come from the
-      # controlling tty. We can't pass /dev/null here (would EOF the prompt)
-      # and we can't inherit our stdin (would consume the curl|bash pipe).
-      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" < /dev/tty
-    else
-      err "Homebrew is required. Install manually from https://brew.sh and re-run."
+  # ---------- 2. Package manager ----------
+  bold "[2/8] Package manager"
+  if [ -n "$IS_MAC" ]; then
+    if ! command -v brew >/dev/null 2>&1; then
+      warn "Homebrew not found. Install it (will run the official installer):"
+      ask "Install Homebrew now? [y/N]"
+      if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+        # The Homebrew installer reads "Press RETURN to continue" from stdin
+        # AND prompts sudo for /opt/homebrew ownership. Both come from the
+        # controlling tty. We can't pass /dev/null here (would EOF the prompt)
+        # and we can't inherit our stdin (would consume the curl|bash pipe).
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" < /dev/tty
+      else
+        err "Homebrew is required. Install manually from https://brew.sh and re-run."
+        exit 1
+      fi
+      if [ -x /opt/homebrew/bin/brew ]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+      fi
+      DONE+=("Installed Homebrew")
+    fi
+    ok "Homebrew: $(brew --version | head -1)"
+  else
+    # Linux: use the native package manager. apt/dpkg only for now (covers
+    # Ubuntu / Debian / Mint / WSL Ubuntu — what lab members actually run).
+    if ! command -v apt-get >/dev/null 2>&1; then
+      err "Only Debian/Ubuntu (apt) is supported on Linux right now."
+      err "Install cloudflared and dnsutils manually, then re-run, or open an issue."
       exit 1
     fi
-    if [ -x /opt/homebrew/bin/brew ]; then
-      eval "$(/opt/homebrew/bin/brew shellenv)"
+    ok "apt: $(apt-get --version | head -1)"
+    log "Refreshing apt index"
+    $SUDO apt-get update -qq
+    # dnsutils → dig (used by /etc/hosts pin); ca-certificates → curl HTTPS.
+    local need_pkgs=()
+    command -v dig >/dev/null 2>&1 || need_pkgs+=(dnsutils)
+    command -v lsof >/dev/null 2>&1 || need_pkgs+=(lsof)
+    command -v rsync >/dev/null 2>&1 || need_pkgs+=(rsync)
+    if [ ${#need_pkgs[@]} -gt 0 ]; then
+      log "Installing base deps: ${need_pkgs[*]}"
+      $SUDO apt-get install -y -qq "${need_pkgs[@]}"
+      DONE+=("Installed base deps via apt: ${need_pkgs[*]}")
     fi
-    DONE+=("Installed Homebrew")
   fi
-  ok "Homebrew: $(brew --version | head -1)"
 
   # ---------- 3. cloudflared ----------
   bold "[3/8] cloudflared"
   if ! command -v cloudflared >/dev/null 2>&1; then
-    log "Installing cloudflared via Homebrew..."
-    brew install cloudflared < /dev/null
-    DONE+=("Installed cloudflared via Homebrew")
+    if [ -n "$IS_MAC" ]; then
+      log "Installing cloudflared via Homebrew..."
+      brew install cloudflared < /dev/null
+      DONE+=("Installed cloudflared via Homebrew")
+    else
+      # Linux: install Cloudflare's signed .deb directly. We avoid adding
+      # their apt repo because this is a one-shot install and we don't want
+      # to leave a third-party source list lying around on the user's box.
+      local arch deb_url tmp_deb
+      case "$(dpkg --print-architecture 2>/dev/null)" in
+        amd64) arch=amd64 ;;
+        arm64) arch=arm64 ;;
+        armhf) arch=armhf ;;
+        *) err "Unsupported arch for cloudflared: $(dpkg --print-architecture)"; exit 1 ;;
+      esac
+      deb_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb"
+      tmp_deb=$(mktemp --suffix=.deb)
+      log "Downloading cloudflared (${arch}) from $deb_url"
+      curl -fsSL --retry 3 -o "$tmp_deb" "$deb_url"
+      log "Installing cloudflared via dpkg"
+      $SUDO dpkg -i "$tmp_deb" >/dev/null
+      rm -f "$tmp_deb"
+      DONE+=("Installed cloudflared via .deb (${arch})")
+    fi
   fi
   ok "cloudflared: $(cloudflared --version 2>&1 | head -1)"
 
@@ -119,35 +197,82 @@ main() {
   bold "[3b/8] Chromium-family browser (required for strict Okta flow)"
   local HAVE_CHROMIUM=""
   local app
-  for app in \
-    "/Applications/Google Chrome.app" \
-    "/Applications/Brave Browser.app" \
-    "/Applications/Chromium.app" \
-    "/Applications/Microsoft Edge.app" \
-    "/Applications/Arc.app"; do
-    if [ -d "$app" ]; then
-      HAVE_CHROMIUM="$app"
-      break
+  if [ -n "$IS_MAC" ]; then
+    for app in \
+      "/Applications/Google Chrome.app" \
+      "/Applications/Brave Browser.app" \
+      "/Applications/Chromium.app" \
+      "/Applications/Microsoft Edge.app" \
+      "/Applications/Arc.app"; do
+      if [ -d "$app" ]; then
+        HAVE_CHROMIUM="$app"
+        break
+      fi
+    done
+  else
+    # Linux: native PATH first; on WSL, fall back to a Windows-side browser.
+    local cmd
+    for cmd in google-chrome google-chrome-stable chromium chromium-browser brave-browser microsoft-edge microsoft-edge-stable; do
+      if command -v "$cmd" >/dev/null 2>&1; then
+        HAVE_CHROMIUM="$(command -v "$cmd")"
+        break
+      fi
+    done
+    if [ -z "$HAVE_CHROMIUM" ] && [ -n "$IS_WSL" ]; then
+      for app in \
+        "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe" \
+        "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe" \
+        "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" \
+        "/mnt/c/Program Files/Microsoft/Edge/Application/msedge.exe" \
+        "/mnt/c/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe"; do
+        if [ -x "$app" ]; then
+          HAVE_CHROMIUM="$app"
+          break
+        fi
+      done
     fi
-  done
+  fi
 
   if [ -z "$HAVE_CHROMIUM" ]; then
-    warn "No Chromium-family browser found."
-    warn "STRICT mode (mandatory) routes the Okta login through an SSH SOCKS5"
-    warn "tunnel into the m2proxymachine, so Okta sees the m2proxymachine's IP — NOT yours."
-    warn "Safari and Firefox cannot be configured for per-instance proxy via CLI,"
-    warn "so we require a Chromium-family browser."
-    echo
-    ask "Install Google Chrome via Homebrew now? [Y/n]"
-    if [[ "${REPLY:-Y}" =~ ^[Nn]$ ]]; then
-      err "A Chromium-family browser is required. Install one and re-run."
-      exit 1
+    if [ -n "$IS_MAC" ]; then
+      warn "No Chromium-family browser found."
+      warn "STRICT mode (mandatory) routes the Okta login through an SSH SOCKS5"
+      warn "tunnel into the m2proxymachine, so Okta sees the m2proxymachine's IP — NOT yours."
+      warn "Safari and Firefox cannot be configured for per-instance proxy via CLI,"
+      warn "so we require a Chromium-family browser."
+      echo
+      ask "Install Google Chrome via Homebrew now? [Y/n]"
+      if [[ "${REPLY:-Y}" =~ ^[Nn]$ ]]; then
+        err "A Chromium-family browser is required. Install one and re-run."
+        exit 1
+      fi
+      brew install --cask google-chrome < /dev/null
+      HAVE_CHROMIUM="/Applications/Google Chrome.app"
+      DONE+=("Installed Google Chrome via Homebrew")
+    else
+      # Linux: don't auto-install — chromium on Ubuntu is a snap (won't run as
+      # root, awkward in WSL), Chrome needs a third-party repo, and the rest
+      # are heavy. The fast path skips the browser entirely when the shared
+      # cert is still fresh, so this is only blocking on the rare first-of-day
+      # Okta login. Warn loudly but don't fail.
+      warn "No Chromium-family browser found."
+      warn "STRICT mode routes the Okta login through an SSH SOCKS5 tunnel into"
+      warn "the m2proxymachine. Safari/Firefox can't do per-instance proxy via CLI."
+      warn ""
+      warn "The fast path in m2-login skips Okta entirely when the shared cert is"
+      warn "still fresh (>=1h left), so this only matters if you're the first lab"
+      warn "member to log in today. To install one later:"
+      if [ -n "$IS_WSL" ]; then
+        warn "  • on Windows: install Microsoft Edge / Chrome via the usual installer"
+        warn "  • or in WSL: sudo apt-get install -y chromium-browser  (snap-based)"
+      else
+        warn "  • Debian/Ubuntu: sudo apt-get install -y chromium  (or chromium-browser)"
+        warn "  • Or download Chrome: https://www.google.com/chrome/"
+      fi
     fi
-    brew install --cask google-chrome < /dev/null
-    HAVE_CHROMIUM="/Applications/Google Chrome.app"
-    DONE+=("Installed Google Chrome via Homebrew")
+  else
+    ok "Found: $HAVE_CHROMIUM"
   fi
-  ok "Found: $HAVE_CHROMIUM"
 
   # ---------- 3c. /etc/hosts IPv4 pin ----------
   # cloudflared dials Cloudflare's edge by hostname. On networks with broken
@@ -185,12 +310,15 @@ main() {
     done <<< "$CF_IPS"
   } >> "$TMP_HOSTS"
 
-  if sudo install -m 644 -o root -g wheel "$TMP_HOSTS" /etc/hosts; then
+  # Group ownership of /etc/hosts: macOS uses 'wheel', Linux uses 'root'.
+  local hosts_group="wheel"
+  [ -n "$IS_LINUX" ] && hosts_group="root"
+  if $SUDO install -m 644 -o root -g "$hosts_group" "$TMP_HOSTS" /etc/hosts; then
     ok "Pinned ssh.alexzms.com → $(echo $CF_IPS | tr '\n' ' ')in /etc/hosts"
     DONE+=("Pinned ssh.alexzms.com → $(echo $CF_IPS | tr '\n' ', ' | sed 's/, $//') in /etc/hosts")
   else
     warn "Could not write /etc/hosts. If ssh fails with 'no route to host', run manually:"
-    warn "    echo '$(echo $CF_IPS | head -1) ssh.alexzms.com' | sudo tee -a /etc/hosts"
+    warn "    echo '$(echo $CF_IPS | head -1) ssh.alexzms.com' | ${SUDO:-} tee -a /etc/hosts"
   fi
   rm -f "$TMP_HOSTS"
 
@@ -344,7 +472,21 @@ EOF
     printf '%s  │  %s%s%s\n' "$YEL" "$CYAN" "$line" "$CR"
   done < "$PUBKEY"
   printf '%s%s%s\n' "$YEL" "  │" "$CR"
-  printf '%s%s%s%s%s\n' "$YEL" "  └─ copy with: " "$B" "pbcopy < $PUBKEY" "$CR"
+  local copy_hint="pbcopy < $PUBKEY"
+  if [ -n "$IS_LINUX" ]; then
+    if [ -n "$IS_WSL" ]; then
+      copy_hint="clip.exe < $PUBKEY"
+    elif command -v wl-copy >/dev/null 2>&1; then
+      copy_hint="wl-copy < $PUBKEY"
+    elif command -v xclip >/dev/null 2>&1; then
+      copy_hint="xclip -selection clipboard < $PUBKEY"
+    elif command -v xsel >/dev/null 2>&1; then
+      copy_hint="xsel --clipboard --input < $PUBKEY"
+    else
+      copy_hint="cat $PUBKEY"
+    fi
+  fi
+  printf '%s%s%s%s%s\n' "$YEL" "  └─ copy with: " "$B" "$copy_hint" "$CR"
   printf '\n'
 
   # Pick the most likely rc file the user's interactive shell will read.

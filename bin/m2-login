@@ -26,9 +26,20 @@ TELEPORT_PROXY="https://mbzuai-hpc.teleport.sh"
 TELEPORT_USER="hao.zhang@mbzuai.ac.ae"
 PORT=8765                # OAuth callback HTTP forwarder
 SOCKS_PORT=51080         # SSH SOCKS5 dynamic forward
-TSH="/opt/homebrew/bin/tsh"
+TSH="/opt/homebrew/bin/tsh"   # path on the remote jump host (m2proxymachine is macOS)
 LOCAL_TSH_DIR="$HOME/.tsh"
-CHROME_PROFILE="$HOME/Library/Caches/m2-login-okta-profile"
+
+# Browser profile cache path differs per OS — Library/Caches on macOS,
+# XDG_CACHE_HOME (~/.cache) on Linux/WSL.
+case "$(uname -s)" in
+  Darwin) CHROME_PROFILE="$HOME/Library/Caches/m2-login-okta-profile" ;;
+  Linux)  CHROME_PROFILE="${XDG_CACHE_HOME:-$HOME/.cache}/m2-login-okta-profile" ;;
+  *)      CHROME_PROFILE="$HOME/.m2-login-okta-profile" ;;
+esac
+IS_WSL=""
+if grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease 2>/dev/null; then
+  IS_WSL=1
+fi
 
 log() { printf '\033[1;34m→\033[0m %s\n' "$*"; }
 ok()  { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
@@ -69,26 +80,64 @@ case "${1:-login}" in
 esac
 
 # Locate a Chromium-family browser. Strict mode requires one because Safari
-# and Firefox don't support per-instance proxy via CLI flags on macOS.
+# and Firefox don't support per-instance proxy via CLI flags.
 find_browser() {
-  for app in \
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" \
-    "/Applications/Chromium.app/Contents/MacOS/Chromium" \
-    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" \
-    "/Applications/Arc.app/Contents/MacOS/Arc"; do
-    if [ -x "$app" ]; then
-      printf '%s' "$app"
-      return 0
-    fi
-  done
+  local app cmd
+  case "$(uname -s)" in
+    Darwin)
+      for app in \
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" \
+        "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" \
+        "/Applications/Arc.app/Contents/MacOS/Arc"; do
+        if [ -x "$app" ]; then
+          printf '%s' "$app"
+          return 0
+        fi
+      done
+      ;;
+    Linux)
+      for cmd in google-chrome google-chrome-stable chromium chromium-browser brave-browser microsoft-edge microsoft-edge-stable; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+          command -v "$cmd"
+          return 0
+        fi
+      done
+      # WSL fallback: a Windows-side Chromium browser. WSL2 forwards localhost
+      # so socks5://localhost:51080 works from Windows-side too.
+      if [ -n "$IS_WSL" ]; then
+        for app in \
+          "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe" \
+          "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe" \
+          "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" \
+          "/mnt/c/Program Files/Microsoft/Edge/Application/msedge.exe" \
+          "/mnt/c/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe"; do
+          if [ -x "$app" ]; then
+            printf '%s' "$app"
+            return 0
+          fi
+        done
+      fi
+      ;;
+  esac
   return 1
 }
 
 CHROME=""
 if ! CHROME=$(find_browser); then
   err "STRICT mode requires a Chromium-family browser (Chrome / Brave / Edge / Chromium / Arc)."
-  err "Install Chrome:  brew install --cask google-chrome"
+  case "$(uname -s)" in
+    Darwin) err "Install Chrome:  brew install --cask google-chrome" ;;
+    Linux)
+      if [ -n "$IS_WSL" ]; then
+        err "On WSL: install Microsoft Edge or Chrome on Windows, or apt install chromium."
+      else
+        err "Install Chromium:  sudo apt-get install -y chromium  (or chromium-browser)"
+        err "Or download Chrome: https://www.google.com/chrome/"
+      fi
+      ;;
+  esac
   err "We refuse to fall back to your default browser because that would leak"
   err "your laptop's IP to Okta — defeating the whole point of the jump host."
   exit 1
@@ -151,9 +200,44 @@ check_etc_hosts_drift
 # the "cert is already fresh" fast path and after a fresh tsh login. The
 # files are tiny (a few KB) and the same for everyone, so this is safe to
 # run any time.
+# Resolve the Windows-side ~/.tsh dir on WSL via cmd.exe %USERPROFILE%, so we
+# can keep a Windows-native copy in lockstep. Empty stdout = no mirror.
+detect_wsl_tsh_mirror() {
+  [ -n "${M2_LOGIN_WIN_TSH_DIR:-}" ] && { printf '%s' "$M2_LOGIN_WIN_TSH_DIR"; return 0; }
+  [ -z "$IS_WSL" ] && return 0
+  command -v cmd.exe >/dev/null 2>&1 || return 0
+  command -v wslpath >/dev/null 2>&1 || return 0
+  local up p
+  # Run cmd.exe from /mnt/c so it doesn't whine about UNC cwd.
+  up=$(cd /mnt/c 2>/dev/null && cmd.exe /c "echo %USERPROFILE%" 2>/dev/null | tr -d '\r\n')
+  [ -z "$up" ] && return 0
+  p=$(wslpath -u "$up" 2>/dev/null) || return 0
+  [ -z "$p" ] || [ ! -d "$p" ] && return 0
+  printf '%s/.tsh' "$p"
+}
+
 sync_cert() {
   log "Syncing cert files to ${LOCAL_TSH_DIR}/"
   mkdir -p "$LOCAL_TSH_DIR"
+
+  # Refuse to write into a symlink that points at /mnt/* — DrvFs reports
+  # every file as 0777 there, which OpenSSH rejects with "permissions too
+  # open". Bail loudly instead of silently producing an unusable cert.
+  if [ -L "${LOCAL_TSH_DIR}/keys" ]; then
+    local link_target
+    link_target=$(readlink -f "${LOCAL_TSH_DIR}/keys" 2>/dev/null \
+                  || readlink "${LOCAL_TSH_DIR}/keys")
+    case "$link_target" in
+      /mnt/*)
+        err "${LOCAL_TSH_DIR}/keys is a symlink into a Windows mount ($link_target)."
+        err "DrvFs reports all files there as 0777 → ssh refuses to load the key."
+        err "Remove the symlink and re-run:"
+        err "    rm '${LOCAL_TSH_DIR}/keys'"
+        exit 1
+        ;;
+    esac
+  fi
+
   if ! rsync -a -e "ssh -o ConnectTimeout=15" "${JUMP_HOST}:.tsh/keys/" "${LOCAL_TSH_DIR}/keys/"; then
     err "cert sync failed"
     exit 1
@@ -163,6 +247,35 @@ sync_cert() {
     "${JUMP_HOST}:.tsh/mbzuai-hpc.teleport.sh.yaml" \
     "${JUMP_HOST}:.tsh/known_hosts" \
     "${LOCAL_TSH_DIR}/" 2>/dev/null || true
+
+  # Tighten perms unconditionally. rsync -a preserves source perms, but a
+  # restrictive consumer (OpenSSH) reads its own bits regardless of how the
+  # cert got there — and a careless mount or umask can still leave stuff
+  # group/world-readable. Strip g+o entirely under keys/.
+  chmod 700 "${LOCAL_TSH_DIR}/keys" 2>/dev/null || true
+  find "${LOCAL_TSH_DIR}/keys" -type d -exec chmod 700 {} + 2>/dev/null || true
+  find "${LOCAL_TSH_DIR}/keys" -type f -exec chmod 600 {} + 2>/dev/null || true
+  chmod 600 "${LOCAL_TSH_DIR}/known_hosts" 2>/dev/null || true
+
+  # WSL: keep a copy on the Windows side too (Windows-native tsh/SSH can
+  # use it directly). DrvFs ignores Unix perms, but the WSL-native copy
+  # above is what ssh on Linux loads, so the loose Windows-side mode is
+  # not a problem here.
+  local win_tsh
+  win_tsh=$(detect_wsl_tsh_mirror)
+  if [ -n "$win_tsh" ]; then
+    log "Mirroring cert to Windows side: $win_tsh/"
+    mkdir -p "$win_tsh/keys"
+    if rsync -a --delete --no-perms --no-owner --no-group \
+         "${LOCAL_TSH_DIR}/keys/" "$win_tsh/keys/" 2>/dev/null; then
+      cp -f "${LOCAL_TSH_DIR}/current-profile" "$win_tsh/" 2>/dev/null || true
+      cp -f "${LOCAL_TSH_DIR}/mbzuai-hpc.teleport.sh.yaml" "$win_tsh/" 2>/dev/null || true
+      cp -f "${LOCAL_TSH_DIR}/known_hosts" "$win_tsh/" 2>/dev/null || true
+      ok "Windows mirror updated"
+    else
+      warn "Windows mirror failed (continuing — WSL-native cert is fine)"
+    fi
+  fi
 }
 
 # Fast path: if the shared cert on the jump host still has >=1h left, skip
@@ -258,8 +371,16 @@ while IFS= read -r line; do
     #   --disable-default-apps / --no-pings
     #                   silence Chrome's chatty side traffic so nothing
     #                   non-Okta accidentally fires a non-proxied request.
+    # If we picked a Windows-side browser (WSL fallback), --user-data-dir
+    # must be a Windows path or Chrome silently falls back to the default
+    # profile — defeating the isolation.
+    profile_arg="$CHROME_PROFILE"
+    if [[ "$CHROME" == /mnt/c/* ]] && command -v wslpath >/dev/null 2>&1; then
+      mkdir -p "$CHROME_PROFILE"
+      profile_arg=$(wslpath -w "$CHROME_PROFILE")
+    fi
     "$CHROME" \
-      --user-data-dir="$CHROME_PROFILE" \
+      --user-data-dir="$profile_arg" \
       --proxy-server="socks5://localhost:${SOCKS_PORT}" \
       --proxy-bypass-list="127.0.0.1,localhost" \
       --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
