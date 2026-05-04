@@ -1,5 +1,7 @@
 # m2proxyserver
 
+> **On Windows + WSL?** This branch installs for **macOS only**. Use the [`wsl` branch](https://github.com/FoundationResearch/m2proxyserver/tree/wsl) instead — its `setup-wsl.sh` installs both sides (WSL and Windows) in one run, so `ssh m2-login-001` works from PowerShell, Windows Terminal, VS Code Remote-SSH, *and* WSL against the same identity.
+
 ## Setup (macOS)
 
 ```bash
