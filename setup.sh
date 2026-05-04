@@ -379,7 +379,7 @@ Host m2-login-001 m2-login-003 *.mbzuai-hpc.teleport.sh
   IdentityFile ~/.tsh/keys/mbzuai-hpc.teleport.sh/hao.zhang@mbzuai.ac.ae
   CertificateFile ~/.tsh/keys/mbzuai-hpc.teleport.sh/hao.zhang@mbzuai.ac.ae-ssh/mbzuai-hpc.teleport.sh-cert.pub
   UserKnownHostsFile ~/.tsh/known_hosts
-  ProxyCommand ssh -q m2proxymachine /opt/homebrew/bin/tsh proxy ssh --cluster mbzuai-hpc.teleport.sh --proxy mbzuai-hpc.teleport.sh:443 %r@%h:%p
+  ProxyCommand bash -c '~/.local/bin/m2-login check && exec ssh -q m2proxymachine /opt/homebrew/bin/tsh proxy ssh --cluster mbzuai-hpc.teleport.sh --proxy mbzuai-hpc.teleport.sh:443 %r@%h:%p'
   ServerAliveInterval 30
   ServerAliveCountMax 3
   ForwardAgent yes
