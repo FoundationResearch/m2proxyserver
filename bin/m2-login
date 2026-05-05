@@ -138,7 +138,17 @@ check_for_updates() {
     err "Update failed (setup.sh exited non-zero). Local m2-login left unchanged."
     return 1
   fi
-  ok "Update complete. Re-launching with new version..."
+  ok "Update complete."
+  # Two call sites with different semantics:
+  #   `m2-login update` (force=1): user explicitly asked to update; they're
+  #     not in the middle of logging in. Just exit — don't surprise them
+  #     with an unsolicited Okta flow.
+  #   auto-check (force=""): user ran `m2-login` to log in, we updated
+  #     mid-flight. Exec the fresh binary so they get what they asked for.
+  if [ -n "$force" ]; then
+    exit 0
+  fi
+  log "Re-launching with new version..."
   exec "$self" "$@"
 }
 
