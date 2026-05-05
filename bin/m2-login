@@ -375,6 +375,7 @@ log "Starting tsh login on ${JUMP_HOST}. If Okta is needed, an isolated Chrome w
 
 opened=""
 cert_fresh=""
+login_ok=""
 # Regex matches the OAuth callback URL tsh prints. We use it twice:
 #   1. as a *filter* — never echo a line containing it, because every
 #      modern terminal (iTerm/Terminal/kitty/wezterm) auto-linkifies URLs
@@ -430,6 +431,12 @@ while IFS= read -r line; do
       ok "Another lab member just refreshed the cert — skipping Okta."
       cert_fresh=1
       ;;
+    M2LOGIN_LOGIN_OK)
+      login_ok=1
+      ;;
+    M2LOGIN_LOGIN_FAIL)
+      login_ok=""
+      ;;
   esac
 done < <(
   ssh -o ServerAliveInterval=30 "$JUMP_HOST" "
@@ -459,9 +466,23 @@ done < <(
       echo M2LOGIN_CERT_FRESH
       exit 0
     fi
-    $TSH login --proxy=$TELEPORT_PROXY --user=$TELEPORT_USER --auth=okta --browser=none --bind-addr=127.0.0.1:${PORT}
+    if $TSH login --proxy=$TELEPORT_PROXY --user=$TELEPORT_USER --auth=okta --browser=none --bind-addr=127.0.0.1:${PORT}; then
+      echo M2LOGIN_LOGIN_OK
+    else
+      echo M2LOGIN_LOGIN_FAIL
+    fi
   " 2>&1
 )
+
+# Bail if neither path completed. Most common cause: the dashboard's
+# 'Force release lock' button SIGTERM'd our tsh login. Without this,
+# the script falls through to ssh_retry+sync_cert and silently rsyncs
+# the (still-stale) cert, leaving the user thinking they're logged in.
+if [ -z "$cert_fresh" ] && [ -z "$login_ok" ]; then
+  err "tsh login did not complete — likely interrupted (admin force-release, network drop, or Okta cancelled)."
+  err "Re-run:   m2-login"
+  exit 1
+fi
 
 # ---- 4. Verify cert ----
 log "Verifying tsh status on ${JUMP_HOST}"
