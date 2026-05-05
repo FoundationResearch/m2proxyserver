@@ -391,7 +391,18 @@ cleanup() {
   kill_listener "$PORT"
   kill_listener "$SOCKS_PORT"
 }
-trap cleanup EXIT INT TERM
+# INT/TERM must explicitly exit. Otherwise bash runs the trap and then
+# resumes after the interrupted builtin, so a Ctrl-C during the lock-wait
+# read loop falls through into `ssh_retry` (8 attempts × 2s) and looks
+# completely unresponsive. 130 = standard SIGINT exit code.
+on_interrupt() {
+  echo
+  warn "Aborted by user."
+  cleanup
+  exit 130
+}
+trap cleanup EXIT
+trap on_interrupt INT TERM
 
 check_etc_hosts_drift
 
