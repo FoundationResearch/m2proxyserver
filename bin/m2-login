@@ -292,6 +292,45 @@ kill_listener() {
   fi
 }
 
+# pick_free_port <preferred>  →  echoes a port that's not currently being
+# listened on locally. Prefers the requested port; if a stale ssh forward
+# from a previous m2-login is squatting, we kill it and reuse. If anything
+# else holds the port (VS Code's Code Helper has been seen on 8765, Node
+# debuggers, other local servers), we fall back to a random port in
+# 40000-49999 — both the local `-L`/`-D` and the remote tsh --bind-addr
+# templated from this var will then use the new port consistently.
+# All status output goes to stderr so callers can `$(capture)` safely.
+pick_free_port() {
+  local preferred=$1 holder_pid holder_cmd p
+  if [ -z "$(lsof -nP -iTCP:${preferred} -sTCP:LISTEN -t 2>/dev/null)" ]; then
+    echo "$preferred"
+    return
+  fi
+  holder_pid=$(lsof -nP -iTCP:${preferred} -sTCP:LISTEN -t 2>/dev/null | head -1)
+  # ps -o comm= can return a full path with spaces (e.g. "/Applications/Visual Studio…").
+  # Strip to a useful basename: take the last path segment, then trim at the
+  # first space so it reads cleanly in the warn message.
+  holder_cmd=$(ps -o comm= -p "$holder_pid" 2>/dev/null | sed 's|.*/||; s| .*||')
+  if [[ "$holder_cmd" == *ssh ]]; then
+    kill_listener "$preferred"
+    sleep 1
+    if [ -z "$(lsof -nP -iTCP:${preferred} -sTCP:LISTEN -t 2>/dev/null)" ]; then
+      echo "$preferred"
+      return
+    fi
+  fi
+  warn "port ${preferred} is held by ${holder_cmd:-unknown} (pid ${holder_pid}); falling back to a random free port" >&2
+  for _ in $(seq 1 20); do
+    p=$(( (RANDOM % 10000) + 40000 ))
+    if [ -z "$(lsof -nP -iTCP:${p} -sTCP:LISTEN -t 2>/dev/null)" ]; then
+      echo "$p"
+      return
+    fi
+  done
+  err "could not find a free port near ${preferred}"
+  exit 1
+}
+
 cleanup() {
   kill_listener "$PORT"
   kill_listener "$SOCKS_PORT"
@@ -330,13 +369,23 @@ kill_listener "$PORT"
 kill_listener "$SOCKS_PORT"
 sleep 1
 
-# ---- 1. OAuth callback port forward (localhost:8765 → m2proxymachine:8765) ----
+# Resolve the actual ports we'll use. If the preferred port is held by a
+# non-ssh process (this has happened with VS Code's Code Helper grabbing
+# 8765), pick_free_port falls back to a random port. PORT is templated
+# into the remote tsh --bind-addr below, so both ends stay in sync.
+PORT=$(pick_free_port "$PORT")
+SOCKS_PORT=$(pick_free_port "$SOCKS_PORT")
+
+# ---- 1. OAuth callback port forward (localhost:${PORT} → m2proxymachine:${PORT}) ----
 log "Establishing port forward localhost:${PORT} → ${JUMP_HOST}:${PORT}"
 forward_up=0
 for try in 1 2 3 4 5; do
   ssh -o ConnectTimeout=10 -f -N -L "${PORT}:127.0.0.1:${PORT}" "$JUMP_HOST" 2>/dev/null
   sleep 1
-  if lsof -nP -i tcp:${PORT} -sTCP:LISTEN >/dev/null 2>&1; then
+  # -c ssh: only count an ssh listener as success. Otherwise a stray
+  # process holding the port (e.g. VS Code Code Helper on 8765) gives a
+  # false positive and Chrome's OAuth callback ends up at the wrong server.
+  if lsof -a -nP -i tcp:${PORT} -sTCP:LISTEN -c ssh >/dev/null 2>&1; then
     forward_up=1
     ok "callback forward up (attempt ${try})"
     break
@@ -352,7 +401,7 @@ socks_up=0
 for try in 1 2 3 4 5; do
   ssh -o ConnectTimeout=10 -D ${SOCKS_PORT} -f -N "$JUMP_HOST" 2>/dev/null
   sleep 1
-  if lsof -nP -i tcp:${SOCKS_PORT} -sTCP:LISTEN >/dev/null 2>&1; then
+  if lsof -a -nP -i tcp:${SOCKS_PORT} -sTCP:LISTEN -c ssh >/dev/null 2>&1; then
     socks_up=1
     ok "SOCKS5 up (attempt ${try})"
     break
